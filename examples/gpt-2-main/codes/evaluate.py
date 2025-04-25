@@ -6,7 +6,7 @@ from datasets import load_dataset
 device = "cuda"
 
 # model_id = "/mnt/self-define/Xinbz/models/llms/gpt2"
-model_id = "./ckpts/adafactor_128/checkpoint-1116"
+model_id = "./output_cs/Adafactor_NoGradAccumulation_Lora8/checkpoint-1116"
 
 model = GPT2LMHeadModel.from_pretrained(model_id).to(device)
 tokenizer = GPT2TokenizerFast.from_pretrained(model_id)

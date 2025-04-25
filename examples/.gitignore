@@ -1,3 +1,6 @@
 gpt-2-main/codes/ckpts/
 gpt-2-main/codes/output/
 gpt-2-main/codes/wandb/
+gpt-2-main/codes/output_cs/
+gpt-2-main/codes/runs/
+gpt-2-main/codes/test.py
