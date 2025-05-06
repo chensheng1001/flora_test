@@ -1,3 +1,6 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import torch
 import sys
 import os
@@ -13,9 +16,10 @@ from transformers import (
 from torch.optim import AdamW
 from peft import get_peft_model, LoraConfig
 from datasets import load_dataset
-from flora_opt import Flora  # 你自定义的优化器
+from flora_opt import Flora, FloraAccelerator  # 你自定义的优化器
 from transformers import TrainerCallback
 from torch.utils.tensorboard import SummaryWriter
+from accelerate import Accelerator 
 
 # === 实时监控显存、优化器和loss ===
 class MonitorCallback(TrainerCallback):
@@ -60,9 +64,13 @@ class MonitorCallback(TrainerCallback):
 
 # === 可选优化器的Trainer ===
 class CustomTrainer(Trainer):
-    def __init__(self, *args, custom_optim=None, flora_rank=None, **kwargs):
+    def __init__(self, *args, custom_optim=None, flora_rank=None, is_gradient_accumulation=False, is_flora_gradient_accumulation=False, **kwargs):
         self.custom_optim = custom_optim
         self.flora_rank = flora_rank
+        if is_flora_gradient_accumulation and is_gradient_accumulation:
+            self.accelerator = FloraAccelerator()
+        else:
+            self.accelerator = Accelerator()
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self):
@@ -91,7 +99,27 @@ class CustomTrainer(Trainer):
                 )
             else:
                 raise ValueError(f"未知优化器类型: {self.custom_optim}")
+            # 使用accelerator准备优化器
+            self.optimizer = self.accelerator.prepare(self.optimizer)
         return self.optimizer
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # 使用accelerator进行自动的梯度累积
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        
+        with self.accelerator.accumulate(model):
+            outputs = model(**inputs)
+            loss = outputs.loss
+            self.accelerator.backward(loss)
+            
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+            
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            
+        return loss.detach()
 
 # === 预处理 ===
 def preprocess(dataset, tokenizer):
@@ -101,13 +129,31 @@ def preprocess(dataset, tokenizer):
 
 # === 主函数 ===
 def train(model_name, base_output_dir, overwrite_output_dir, per_device_train_batch_size,
-          num_train_epochs, save_steps, optim_type="flora", flora_rank=128, is_lora=False, lora_rank = 128 ):   
+          num_train_epochs, save_steps, optim_type="flora", flora_rank=128, is_lora=False, lora_rank=128,
+          is_gradient_accumulation=False, gradient_accumulation_step=4, is_flora_gradient_accumulation=False,
+          flora_rank_gradient_accumulation=4):   
     if optim_type == "flora":
-        output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}{flora_rank}_NoGradAccumulation")
-        tf_dir = f"./runs/{optim_type.capitalize()}{flora_rank}_NoGradAccumulation"
+        if is_gradient_accumulation:
+            if is_flora_gradient_accumulation:
+                output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}{flora_rank}_FloraGradAccumulation{gradient_accumulation_step}")
+                tf_dir = f"./runs/{optim_type.capitalize()}{flora_rank}_FloraGradAccumulation{gradient_accumulation_step}"
+            else:
+                output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}{flora_rank}_GradAccumulation{gradient_accumulation_step}")
+                tf_dir = f"./runs/{optim_type.capitalize()}{flora_rank}_GradAccumulation{gradient_accumulation_step}"
+        else:
+            output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}{flora_rank}_NoGradAccumulation")
+            tf_dir = f"./runs/{optim_type.capitalize()}{flora_rank}_NoGradAccumulation"
     else:
-        output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}_NoGradAccumulation")
-        tf_dir = f"./runs/{optim_type.capitalize()}_NoGradAccumulation"
+        if is_gradient_accumulation:
+            if is_flora_gradient_accumulation:
+                output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}_FloraGradAccumulation{gradient_accumulation_step}")
+                tf_dir = f"./runs/{optim_type.capitalize()}_FloraGradAccumulation{gradient_accumulation_step}"
+            else:
+                output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}_GradAccumulation{gradient_accumulation_step}")
+                tf_dir = f"./runs/{optim_type.capitalize()}_GradAccumulation{gradient_accumulation_step}"
+        else:
+            output_dir = os.path.join(base_output_dir, f"{optim_type.capitalize()}_NoGradAccumulation")
+            tf_dir = f"./runs/{optim_type.capitalize()}_NoGradAccumulation"
 
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
@@ -131,20 +177,37 @@ def train(model_name, base_output_dir, overwrite_output_dir, per_device_train_ba
 
     writer = SummaryWriter(log_dir=tf_dir)
 
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        overwrite_output_dir=overwrite_output_dir,
-        per_device_train_batch_size=per_device_train_batch_size,
-        num_train_epochs=num_train_epochs,
-        save_steps=save_steps,
-        learning_rate=1e-4,
-        weight_decay=0.01,
-        logging_steps=50,
-        evaluation_strategy="steps",
-        eval_steps=200,
-        save_total_limit=2,
-        report_to=[],
-    )
+    if is_gradient_accumulation:
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            overwrite_output_dir=overwrite_output_dir,
+            per_device_train_batch_size=per_device_train_batch_size,
+            num_train_epochs=num_train_epochs,
+            save_steps=save_steps,
+            learning_rate=1e-4,
+            weight_decay=0.01,
+            logging_steps=50,
+            evaluation_strategy="steps",
+            eval_steps=200,
+            save_total_limit=2,
+            report_to=[],
+            gradient_accumulation_steps=gradient_accumulation_step
+        )
+    else:
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            overwrite_output_dir=overwrite_output_dir,
+            per_device_train_batch_size=per_device_train_batch_size,
+            num_train_epochs=num_train_epochs,
+            save_steps=save_steps,
+            learning_rate=1e-4,
+            weight_decay=0.01,
+            logging_steps=50,
+            evaluation_strategy="steps",
+            eval_steps=200,
+            save_total_limit=2,
+            report_to=[],
+        )
 
     trainer = CustomTrainer(
         model=model,
@@ -154,7 +217,9 @@ def train(model_name, base_output_dir, overwrite_output_dir, per_device_train_ba
         eval_dataset=eval_dateset,
         callbacks=[MonitorCallback(writer)],
         custom_optim=optim_type,
-        flora_rank=flora_rank
+        flora_rank=flora_rank,
+        is_gradient_accumulation=is_gradient_accumulation,
+        is_flora_gradient_accumulation=is_flora_gradient_accumulation,
     )
 
     print(f"[启动训练] 当前使用优化器: {optim_type}")
@@ -169,11 +234,14 @@ if __name__ == "__main__":
         model_name="/mnt/self-define/Xinbz/models/llms/gpt2",
         base_output_dir="./output_cs",
         overwrite_output_dir=True,
-        per_device_train_batch_size=32,
+        per_device_train_batch_size=16,
         num_train_epochs=3,
         save_steps=1000,
         optim_type="adafactor",  # 可选："adamw", "adafactor", "flora"
         flora_rank=8,  # 仅flora时需要指定flora_rank, 8, 32, 128, 256
-        is_lora=True,
-        lora_rank=32  # 仅is_lora=True时需要指定lora_rank 
+        is_lora=False,
+        lora_rank=8,  # 仅is_lora=True时需要指定lora_rank 
+        is_gradient_accumulation = True,
+        gradient_accumulation_step = 4, # is_gradient_accumulation=True时需要指定gradient_accumulation_step
+        is_flora_gradient_accumulation = True
     )

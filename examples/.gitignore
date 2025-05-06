@@ -4,3 +4,6 @@ gpt-2-main/codes/wandb/
 gpt-2-main/codes/output_cs/
 gpt-2-main/codes/runs/
 gpt-2-main/codes/test.py
+gpt-2-main/codes/train2.py
+gpt-2-main/torch/runs/
+
